@@ -1,0 +1,23 @@
+﻿# Секреты — никогда не коммитить
+.env
+
+# Логи
+logs/
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# БД (старый SQLite)
+*.db
+
+# Docker
+.dockerignore
+
+# IDE
+.vscode/
+.idea/
