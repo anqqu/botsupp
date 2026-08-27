@@ -169,7 +169,126 @@ async def save_template_content(message: Message, state: FSMContext):
 
 
 # ──────────────────────────────────────────────────────────────
-#  /t <название>  — отправить шаблон пользователю в топике
+#  Хелпер: отправить шаблон пользователю и вернуть подтверждение
+#  Используется и из /t, и из callback tsend:
+# ──────────────────────────────────────────────────────────────
+async def _send_template_to_user(
+    bot: Bot,
+    row: dict,
+    user_id: int,
+    support_msg_id: int,
+    reply_chat_id: int,
+    reply_msg_id: int,
+    thread_id: int | None,
+) -> str:
+    """
+    Отправляет шаблон пользователю, сохраняет message_map для /delete.
+    Возвращает HTML-текст подтверждения (без медиа).
+    """
+    ct = row["content_type"]
+    caption = row["content"] or None
+    name = row["name"]
+
+    if ct == "text":
+        sent = await bot.send_message(
+            chat_id=user_id, text=row["content"], parse_mode="HTML"
+        )
+    elif ct == "photo":
+        sent = await bot.send_photo(
+            chat_id=user_id, photo=row["file_id"],
+            caption=caption or None, parse_mode="HTML"
+        )
+    elif ct == "video":
+        sent = await bot.send_video(
+            chat_id=user_id, video=row["file_id"],
+            caption=caption or None, parse_mode="HTML"
+        )
+    elif ct == "document":
+        sent = await bot.send_document(
+            chat_id=user_id, document=row["file_id"],
+            caption=caption or None, parse_mode="HTML"
+        )
+    elif ct == "voice":
+        sent = await bot.send_voice(chat_id=user_id, voice=row["file_id"])
+    elif ct == "sticker":
+        sent = await bot.send_sticker(chat_id=user_id, sticker=row["file_id"])
+    else:
+        raise ValueError(f"Неизвестный content_type: {ct}")
+
+    # Маппинг для /delete
+    await db.execute(
+        "INSERT INTO message_map (support_msg_id, user_id, user_msg_id) "
+        "VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+        support_msg_id, user_id, sent.message_id
+    )
+
+    emoji = CONTENT_TYPE_EMOJI.get(ct, "📝")
+    confirm_header = f"✅ Шаблон {emoji} <b>«{name}»</b> отправлен пользователю."
+
+    # Подтверждение с превью
+    if ct == "text":
+        await bot.send_message(
+            chat_id=reply_chat_id,
+            text=f"{confirm_header}\n\n<blockquote>{row['content']}</blockquote>",
+            parse_mode="HTML",
+            message_thread_id=thread_id,
+            reply_to_message_id=reply_msg_id
+        )
+    elif ct in ("photo", "video", "document", "voice"):
+        send_fn = {
+            "photo": bot.send_photo,
+            "video": bot.send_video,
+            "document": bot.send_document,
+            "voice": bot.send_voice,
+        }[ct]
+        file_kwarg = {
+            "photo": "photo", "video": "video",
+            "document": "document", "voice": "voice"
+        }[ct]
+        extra_caption = (f"\n<blockquote>{caption}</blockquote>" if caption and ct != "voice" else "")
+        await send_fn(
+            chat_id=reply_chat_id,
+            **{file_kwarg: row["file_id"]},
+            caption=confirm_header + extra_caption,
+            parse_mode="HTML",
+            message_thread_id=thread_id,
+            reply_to_message_id=reply_msg_id
+        )
+    else:
+        await bot.send_message(
+            chat_id=reply_chat_id,
+            text=confirm_header,
+            parse_mode="HTML",
+            message_thread_id=thread_id,
+            reply_to_message_id=reply_msg_id
+        )
+
+    return confirm_header
+
+
+def _build_template_picker(rows, callback_prefix: str) -> InlineKeyboardMarkup:
+    """Строит клавиатуру выбора шаблона: 2 кнопки в ряд + кнопка Отмена."""
+    buttons = []
+    row_buf = []
+    for r in rows:
+        emoji = CONTENT_TYPE_EMOJI.get(r["content_type"], "📝")
+        btn = InlineKeyboardButton(
+            text=f"{emoji} {r['name']}",
+            callback_data=f"{callback_prefix}:{r['name']}"
+        )
+        row_buf.append(btn)
+        if len(row_buf) == 2:
+            buttons.append(row_buf)
+            row_buf = []
+    if row_buf:
+        buttons.append(row_buf)
+    # Кнопка отмены отдельной строкой
+    buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="tcancel")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+# ──────────────────────────────────────────────────────────────
+#  /t [название]  — отправить шаблон или показать пикер
 # ──────────────────────────────────────────────────────────────
 @router.message(Command("t"), F.chat.type.in_({"group", "supergroup"}))
 async def cmd_use_template(message: Message, bot: Bot):
@@ -179,19 +298,41 @@ async def cmd_use_template(message: Message, bot: Bot):
         await message.reply("⚠️ Эта команда используется только внутри топика тикета.")
         return
 
+    # Проверяем тикет заранее (нужен и для пикера, и для прямой отправки)
+    ticket = await db.fetchrow(
+        "SELECT user_id, status FROM tickets WHERE thread_id = $1",
+        message.message_thread_id
+    )
+    if not ticket:
+        await message.reply("❌ Этот топик не связан ни с одним тикетом.")
+        return
+    if not ticket["status"]:
+        await message.reply("⚠️ Тикет закрыт. Нельзя отправить шаблон.")
+        return
+
     parts = message.text.split(maxsplit=1)
-    if len(parts) < 2 or not parts[1].strip():
+    name = parts[1].strip().lower().replace(" ", "_") if len(parts) >= 2 and parts[1].strip() else None
+
+    # ── Режим пикера: /t без аргумента ──
+    if not name:
+        rows = await db.fetch("SELECT name, content_type FROM templates ORDER BY name")
+        if not rows:
+            await message.reply(
+                "📋 Шаблонов пока нет.\n"
+                "Создайте первый: <code>/tcreate название</code>",
+                parse_mode="HTML"
+            )
+            return
+
+        keyboard = _build_template_picker(rows, callback_prefix="tsend")
         await message.reply(
-            "❌ Укажите название шаблона.\n"
-            "Пример: <code>/t rules</code>\n"
-            "Список шаблонов: <code>/tlist</code>",
-            parse_mode="HTML"
+            "📝 <b>Выберите шаблон для отправки:</b>",
+            parse_mode="HTML",
+            reply_markup=keyboard
         )
         return
 
-    name = parts[1].strip().lower().replace(" ", "_")
-
-    # Ищем шаблон
+    # ── Режим прямой отправки: /t rules ──
     row = await db.fetchrow("SELECT * FROM templates WHERE name = $1", name)
     if not row:
         await message.reply(
@@ -201,122 +342,76 @@ async def cmd_use_template(message: Message, bot: Bot):
         )
         return
 
-    # Находим пользователя по топику
+    try:
+        await _send_template_to_user(
+            bot=bot, row=dict(row),
+            user_id=ticket["user_id"],
+            support_msg_id=message.message_id,
+            reply_chat_id=message.chat.id,
+            reply_msg_id=message.message_id,
+            thread_id=message.message_thread_id,
+        )
+        logger.info(f"Template '{name}' sent to user {ticket['user_id']} by {message.from_user.id}")
+    except Exception as e:
+        logger.error(f"Error sending template '{name}': {e}")
+        await message.reply(f"❌ Ошибка при отправке шаблона: {e}")
+
+
+# ──────────────────────────────────────────────────────────────
+#  Callback: tsend:<name>  — выбор из пикера → отправить
+# ──────────────────────────────────────────────────────────────
+@router.callback_query(F.data.startswith("tsend:"))
+async def callback_tsend(call: CallbackQuery, bot: Bot):
+    if call.message.chat.id != SUPPORT_GROUP_ID:
+        await call.answer()
+        return
+
+    name = call.data.split(":", 1)[1]
+    thread_id = call.message.message_thread_id
+
+    # Ищем тикет по топику
     ticket = await db.fetchrow(
-        "SELECT user_id, status FROM tickets WHERE thread_id = $1",
-        message.message_thread_id
+        "SELECT user_id, status FROM tickets WHERE thread_id = $1", thread_id
     )
     if not ticket:
-        await message.reply("❌ Этот топик не связан ни с одним тикетом.")
+        await call.answer("❌ Топик не связан с тикетом.", show_alert=True)
         return
     if not ticket["status"]:
-        await message.reply("⚠️ Тикет закрыт. Нельзя отправить шаблон в закрытый тикет.")
+        await call.answer("⚠️ Тикет закрыт.", show_alert=True)
         return
 
-    user_id = ticket["user_id"]
+    row = await db.fetchrow("SELECT * FROM templates WHERE name = $1", name)
+    if not row:
+        await call.answer(f"Шаблон «{name}» не найден.", show_alert=True)
+        return
 
-    # Отправляем шаблон пользователю
+    await call.answer()  # убираем часики
+
     try:
-        ct = row["content_type"]
-        caption = row["content"] or None
-
-        if ct == "text":
-            sent = await bot.send_message(
-                chat_id=user_id,
-                text=row["content"],
-                parse_mode="HTML"
-            )
-        elif ct == "photo":
-            sent = await bot.send_photo(
-                chat_id=user_id,
-                photo=row["file_id"],
-                caption=caption or None,
-                parse_mode="HTML"
-            )
-        elif ct == "video":
-            sent = await bot.send_video(
-                chat_id=user_id,
-                video=row["file_id"],
-                caption=caption or None,
-                parse_mode="HTML"
-            )
-        elif ct == "document":
-            sent = await bot.send_document(
-                chat_id=user_id,
-                document=row["file_id"],
-                caption=caption or None,
-                parse_mode="HTML"
-            )
-        elif ct == "voice":
-            sent = await bot.send_voice(chat_id=user_id, voice=row["file_id"])
-        elif ct == "sticker":
-            sent = await bot.send_sticker(chat_id=user_id, sticker=row["file_id"])
-        else:
-            await message.reply(f"❌ Неизвестный тип шаблона: {ct}")
-            return
-
-        # Сохраняем маппинг для /delete
-        await db.execute(
-            "INSERT INTO message_map (support_msg_id, user_id, user_msg_id) "
-            "VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
-            message.message_id, user_id, sent.message_id
+        await _send_template_to_user(
+            bot=bot, row=dict(row),
+            user_id=ticket["user_id"],
+            support_msg_id=call.message.message_id,
+            reply_chat_id=call.message.chat.id,
+            reply_msg_id=call.message.message_id,
+            thread_id=thread_id,
         )
-
-        emoji = CONTENT_TYPE_EMOJI.get(ct, "📝")
-        confirm_header = f"✅ Шаблон {emoji} <b>«{name}»</b> отправлен пользователю."
-
-        # Подтверждение с превью того что отправлено
-        if ct == "text":
-            # Показываем текст в blockquote
-            await message.reply(
-                f"{confirm_header}\n\n<blockquote>{row['content']}</blockquote>",
-                parse_mode="HTML"
-            )
-        elif ct == "photo":
-            await bot.send_photo(
-                chat_id=message.chat.id,
-                photo=row["file_id"],
-                caption=f"{confirm_header}" + (f"\n<blockquote>{caption}</blockquote>" if caption else ""),
-                parse_mode="HTML",
-                message_thread_id=message.message_thread_id,
-                reply_to_message_id=message.message_id
-            )
-        elif ct == "video":
-            await bot.send_video(
-                chat_id=message.chat.id,
-                video=row["file_id"],
-                caption=f"{confirm_header}" + (f"\n<blockquote>{caption}</blockquote>" if caption else ""),
-                parse_mode="HTML",
-                message_thread_id=message.message_thread_id,
-                reply_to_message_id=message.message_id
-            )
-        elif ct == "document":
-            await bot.send_document(
-                chat_id=message.chat.id,
-                document=row["file_id"],
-                caption=f"{confirm_header}" + (f"\n<blockquote>{caption}</blockquote>" if caption else ""),
-                parse_mode="HTML",
-                message_thread_id=message.message_thread_id,
-                reply_to_message_id=message.message_id
-            )
-        elif ct == "voice":
-            await bot.send_voice(
-                chat_id=message.chat.id,
-                voice=row["file_id"],
-                caption=confirm_header,
-                parse_mode="HTML",
-                message_thread_id=message.message_thread_id,
-                reply_to_message_id=message.message_id
-            )
-        else:
-            # Стикер и прочее — просто текст
-            await message.reply(confirm_header, parse_mode="HTML")
-
-        logger.info(f"Template '{name}' sent to user {user_id} by {message.from_user.id}")
-
+        # Удаляем пикер
+        await call.message.delete()
+        logger.info(f"Template '{name}' sent via picker to user {ticket['user_id']} by {call.from_user.id}")
     except Exception as e:
-        logger.error(f"Error sending template '{name}' to user {user_id}: {e}")
-        await message.reply(f"❌ Ошибка при отправке шаблона: {e}")
+        logger.error(f"Error sending template '{name}' via picker: {e}")
+        await call.message.answer(f"❌ Ошибка при отправке шаблона: {e}")
+
+
+# ──────────────────────────────────────────────────────────────
+#  Callback: tcancel  — закрыть пикер
+# ──────────────────────────────────────────────────────────────
+@router.callback_query(F.data == "tcancel")
+async def callback_tcancel(call: CallbackQuery):
+    await call.answer("Отменено.")
+    await call.message.delete()
+
 
 
 # ──────────────────────────────────────────────────────────────
