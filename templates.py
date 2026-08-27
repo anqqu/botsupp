@@ -21,6 +21,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     Message,
 )
+from aiogram.utils.text_decorations import html_decoration
 
 from config import SUPPORT_GROUP_ID
 from database import db
@@ -113,19 +114,30 @@ async def save_template_content(message: Message, state: FSMContext):
 
     if message.text:
         content_type = "text"
-        content = message.text
+        # html_text сохраняет ссылки, жирный, курсив и прочее форматирование
+        content = message.html_text
     elif message.photo:
         content_type = "photo"
         file_id = message.photo[-1].file_id
-        content = message.caption or ""
+        # html_decoration.unparse применяет caption entities -> HTML
+        content = html_decoration.unparse(
+            message.caption or "",
+            message.caption_entities or []
+        )
     elif message.video:
         content_type = "video"
         file_id = message.video.file_id
-        content = message.caption or ""
+        content = html_decoration.unparse(
+            message.caption or "",
+            message.caption_entities or []
+        )
     elif message.document:
         content_type = "document"
         file_id = message.document.file_id
-        content = message.caption or ""
+        content = html_decoration.unparse(
+            message.caption or "",
+            message.caption_entities or []
+        )
     elif message.voice:
         content_type = "voice"
         file_id = message.voice.file_id
@@ -209,13 +221,32 @@ async def cmd_use_template(message: Message, bot: Bot):
         caption = row["content"] or None
 
         if ct == "text":
-            sent = await bot.send_message(chat_id=user_id, text=row["content"])
+            sent = await bot.send_message(
+                chat_id=user_id,
+                text=row["content"],
+                parse_mode="HTML"
+            )
         elif ct == "photo":
-            sent = await bot.send_photo(chat_id=user_id, photo=row["file_id"], caption=caption)
+            sent = await bot.send_photo(
+                chat_id=user_id,
+                photo=row["file_id"],
+                caption=caption or None,
+                parse_mode="HTML"
+            )
         elif ct == "video":
-            sent = await bot.send_video(chat_id=user_id, video=row["file_id"], caption=caption)
+            sent = await bot.send_video(
+                chat_id=user_id,
+                video=row["file_id"],
+                caption=caption or None,
+                parse_mode="HTML"
+            )
         elif ct == "document":
-            sent = await bot.send_document(chat_id=user_id, document=row["file_id"], caption=caption)
+            sent = await bot.send_document(
+                chat_id=user_id,
+                document=row["file_id"],
+                caption=caption or None,
+                parse_mode="HTML"
+            )
         elif ct == "voice":
             sent = await bot.send_voice(chat_id=user_id, voice=row["file_id"])
         elif ct == "sticker":
@@ -232,10 +263,55 @@ async def cmd_use_template(message: Message, bot: Bot):
         )
 
         emoji = CONTENT_TYPE_EMOJI.get(ct, "📝")
-        await message.reply(
-            f"✅ Шаблон {emoji} <b>«{name}»</b> отправлен пользователю.",
-            parse_mode="HTML"
-        )
+        confirm_header = f"✅ Шаблон {emoji} <b>«{name}»</b> отправлен пользователю."
+
+        # Подтверждение с превью того что отправлено
+        if ct == "text":
+            # Показываем текст в blockquote
+            await message.reply(
+                f"{confirm_header}\n\n<blockquote>{row['content']}</blockquote>",
+                parse_mode="HTML"
+            )
+        elif ct == "photo":
+            await bot.send_photo(
+                chat_id=message.chat.id,
+                photo=row["file_id"],
+                caption=f"{confirm_header}" + (f"\n<blockquote>{caption}</blockquote>" if caption else ""),
+                parse_mode="HTML",
+                message_thread_id=message.message_thread_id,
+                reply_to_message_id=message.message_id
+            )
+        elif ct == "video":
+            await bot.send_video(
+                chat_id=message.chat.id,
+                video=row["file_id"],
+                caption=f"{confirm_header}" + (f"\n<blockquote>{caption}</blockquote>" if caption else ""),
+                parse_mode="HTML",
+                message_thread_id=message.message_thread_id,
+                reply_to_message_id=message.message_id
+            )
+        elif ct == "document":
+            await bot.send_document(
+                chat_id=message.chat.id,
+                document=row["file_id"],
+                caption=f"{confirm_header}" + (f"\n<blockquote>{caption}</blockquote>" if caption else ""),
+                parse_mode="HTML",
+                message_thread_id=message.message_thread_id,
+                reply_to_message_id=message.message_id
+            )
+        elif ct == "voice":
+            await bot.send_voice(
+                chat_id=message.chat.id,
+                voice=row["file_id"],
+                caption=confirm_header,
+                parse_mode="HTML",
+                message_thread_id=message.message_thread_id,
+                reply_to_message_id=message.message_id
+            )
+        else:
+            # Стикер и прочее — просто текст
+            await message.reply(confirm_header, parse_mode="HTML")
+
         logger.info(f"Template '{name}' sent to user {user_id} by {message.from_user.id}")
 
     except Exception as e:
