@@ -37,6 +37,14 @@ class Database:
                     topic_msg_id BIGINT PRIMARY KEY,
                     user_id      BIGINT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS templates (
+                    name         TEXT PRIMARY KEY,
+                    content_type TEXT NOT NULL,
+                    content      TEXT,
+                    file_id      TEXT,
+                    created_by   BIGINT,
+                    created_at   TEXT
+                );
             ''')
             # Таблицы из ban.py
             await conn.execute('''

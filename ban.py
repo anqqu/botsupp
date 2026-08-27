@@ -319,17 +319,3 @@ async def handle_appeal_action(call: CallbackQuery, bot: Bot):
     await call.answer()
 
 
-# --- /help (только в группе поддержки) ---
-@router.message(Command("help"), F.chat.type.in_({"group", "supergroup"}))
-async def help_command(message: types.Message):
-    if message.chat.id != SUPPORT_GROUP_ID:
-        return
-    text = (
-        "📖 Доступные команды модератора:\n\n"
-        "🛑 /ban <причина> — забанить пользователя (по reply)\n"
-        "♻️ /unban — разбанить (по reply или user_id)\n"
-        "📋 /banlist [страница|@username] — список заблокированных\n"
-        "📜 /banhistory @username|user_id — история блокировок\n"
-        "📨 /appeal (ЛС бота) — апелляция для пользователей\n"
-    )
-    await message.reply(text)

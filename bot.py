@@ -86,16 +86,28 @@ async def help_command(message: Message):
         await message.reply(help_text)
     elif message.chat.id == SUPPORT_GROUP_ID:
         help_text = (
-            "Список доступных команд:\n"
-            "/close - Закрыть тикет (в топике)\n"
-            "/delete - Удалить сообщение у пользователя (reply на сообщение в топике)\n"
-            "/addagent @username или /addagent user_id - Добавить агента\n"
-            "/removeagent @username - Удалить агента\n"
-            "/listagents - Показать список агентов\n"
-            "/export - Экспортировать тикеты в JSON\n"
-            "/help - Показать список команд"
+            "Список доступных команд:\n\n"
+            "📩 <b>Тикеты</b>\n"
+            "/close — Закрыть тикет (в топике)\n"
+            "/delete — Удалить сообщение у пользователя (reply)\n\n"
+            "📝 <b>Шаблоны</b>\n"
+            "/t название — Отправить шаблон пользователю\n"
+            "/tcreate название — Создать новый шаблон\n"
+            "/tlist — Список всех шаблонов\n"
+            "/tdelete название — Удалить шаблон\n\n"
+            "👥 <b>Агенты</b>\n"
+            "/addagent @username — Добавить агента\n"
+            "/removeagent @username — Удалить агента\n"
+            "/listagents — Список агентов\n\n"
+            "🛡️ <b>Модерация</b>\n"
+            "/ban причина — Заблокировать (reply)\n"
+            "/unban — Разблокировать (reply или user_id)\n"
+            "/banlist — Список заблокированных\n"
+            "/banhistory — История блокировок\n\n"
+            "/export — Экспорт тикетов в JSON\n"
+            "/help — Показать этот список"
         )
-        await message.reply(help_text)
+        await message.reply(help_text, parse_mode="HTML")
 
 @router.message(Command("addagent"), F.chat.type.in_({"group", "supergroup"}))
 async def add_agent(message: Message):
@@ -821,6 +833,10 @@ async def main():
         commands=[
             BotCommand(command="close", description="Закрыть тикет (в топике)"),
             BotCommand(command="delete", description="Удалить сообщение у пользователя (reply)"),
+            BotCommand(command="t", description="Отправить шаблон пользователю"),
+            BotCommand(command="tcreate", description="Создать новый шаблон"),
+            BotCommand(command="tlist", description="Список шаблонов"),
+            BotCommand(command="tdelete", description="Удалить шаблон"),
             BotCommand(command="addagent", description="Добавить агента (@username или user_id)"),
             BotCommand(command="removeagent", description="Удалить агента (@username)"),
             BotCommand(command="listagents", description="Показать список агентов"),
@@ -835,8 +851,10 @@ async def main():
     )
 
     import ban as ban_module
-    
+    import templates as templates_module
+
     dp.include_router(ban_module.router)
+    dp.include_router(templates_module.router)  # До основного — для корректного приоритета FSM
     dp.include_router(router)
 
     logger.info("Бот запущен... Нажмите Ctrl+C для завершения.")
