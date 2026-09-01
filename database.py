@@ -43,8 +43,13 @@ class Database:
                     content      TEXT,
                     file_id      TEXT,
                     created_by   BIGINT,
-                    created_at   TEXT
+                    created_at   TEXT,
+                    effect_id    TEXT
                 );
+            ''')
+            # Миграция: добавляем effect_id если таблица уже существовала без неё
+            await conn.execute('''
+                ALTER TABLE templates ADD COLUMN IF NOT EXISTS effect_id TEXT;
             ''')
             # Таблицы из ban.py
             await conn.execute('''
