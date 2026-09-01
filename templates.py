@@ -39,8 +39,17 @@ CONTENT_TYPE_EMOJI = {
 }
 
 
+# Доступные эффекты сообщений
+EFFECTS = {
+    "fireworks": ("5046509860389126442", "🎉 Фейерверк"),
+    "heart":     ("5159385139981059251", "❤️ Сердечко"),
+    "fire":      ("5104841245755180586", "🔥 Огонь"),
+}
+
+
 class TemplateForm(StatesGroup):
     waiting_for_content = State()
+    waiting_for_effect  = State()
 
 
 # ──────────────────────────────────────────────────────────────
@@ -88,6 +97,7 @@ async def cmd_tcreate(message: Message, state: FSMContext):
 #  /cancel — отмена создания шаблона
 # ──────────────────────────────────────────────────────────────
 @router.message(Command("cancel"), TemplateForm.waiting_for_content)
+@router.message(Command("cancel"), TemplateForm.waiting_for_effect)
 async def cmd_cancel(message: Message, state: FSMContext):
     data = await state.get_data()
     name = data.get("template_name", "")
@@ -153,23 +163,83 @@ async def save_template_content(message: Message, state: FSMContext):
         )
         return
 
-    await db.execute(
-        "INSERT INTO templates (name, content_type, content, file_id, created_by, created_at) "
-        "VALUES ($1, $2, $3, $4, $5, $6)",
-        name, content_type, content, file_id, creator_id, created_at
+    # Сохраняем данные в state — запись в БД после выбора эффекта
+    await state.update_data(
+        content_type=content_type,
+        content=content,
+        file_id=file_id,
+        created_at=created_at,
     )
-    await state.clear()
+    await state.set_state(TemplateForm.waiting_for_effect)
 
+    # Строим пикер эффектов
+    effect_buttons = [
+        [InlineKeyboardButton(text=label, callback_data=f"teffect:{key}")
+         for key, (_, label) in EFFECTS.items()],
+        [InlineKeyboardButton(text="⏭️ Без эффекта", callback_data="teffect:none")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="teffect_cancel")],
+    ]
     emoji = CONTENT_TYPE_EMOJI.get(content_type, "📝")
     await message.reply(
-        f"✅ Шаблон {emoji} <b>«{name}»</b> успешно создан!\n"
-        f"Использование: <code>/t {name}</code>",
-        parse_mode="HTML"
+        f"{emoji} Контент получен! Выберите эффект для шаблона <b>«{name}»</b>:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=effect_buttons)
     )
 
 
 # ──────────────────────────────────────────────────────────────
-#  Хелпер: отправить шаблон пользователю и вернуть подтверждение
+#  Callback: teffect:<key>  — выбор эффекта и сохранение шаблона
+# ──────────────────────────────────────────────────────────────
+@router.callback_query(F.data.startswith("teffect:"), TemplateForm.waiting_for_effect)
+async def callback_teffect(call: CallbackQuery, state: FSMContext):
+    key = call.data.split(":", 1)[1]
+    data = await state.get_data()
+
+    name        = data["template_name"]
+    content_type = data["content_type"]
+    content     = data.get("content")
+    file_id     = data.get("file_id")
+    creator_id  = data.get("creator_id")
+    created_at  = data["created_at"]
+
+    # Определяем effect_id
+    effect_id = None
+    effect_label = "Без эффекта"
+    if key != "none" and key in EFFECTS:
+        effect_id, effect_label = EFFECTS[key]
+
+    await db.execute(
+        "INSERT INTO templates (name, content_type, content, file_id, created_by, created_at, effect_id) "
+        "VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        name, content_type, content, file_id, creator_id, created_at, effect_id
+    )
+    await state.clear()
+    await call.answer()
+
+    # Удаляем пикер и показываем подтверждение
+    emoji = CONTENT_TYPE_EMOJI.get(content_type, "📝")
+    effect_hint = f" · {effect_label}" if effect_id else ""
+    await call.message.edit_text(
+        f"✅ Шаблон {emoji} <b>«{name}»</b> создан{effect_hint}!\n"
+        f"Использование: <code>/t {name}</code>",
+        parse_mode="HTML"
+    )
+    logger.info(f"Template '{name}' created with effect_id={effect_id} by {creator_id}")
+
+
+# ──────────────────────────────────────────────────────────────
+#  Callback: teffect_cancel  — отмена создания на этапе эффекта
+# ──────────────────────────────────────────────────────────────
+@router.callback_query(F.data == "teffect_cancel", TemplateForm.waiting_for_effect)
+async def callback_teffect_cancel(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    name = data.get("template_name", "")
+    await state.clear()
+    await call.answer("Отменено.")
+    await call.message.edit_text(f"❌ Создание шаблона «{name}» отменено.")
+
+
+# ──────────────────────────────────────────────────────────────
 #  Используется и из /t, и из callback tsend:
 # ──────────────────────────────────────────────────────────────
 async def _send_template_to_user(
@@ -188,32 +258,53 @@ async def _send_template_to_user(
     ct = row["content_type"]
     caption = row["content"] or None
     name = row["name"]
+    effect_id: str | None = row.get("effect_id") or None
 
-    if ct == "text":
-        sent = await bot.send_message(
-            chat_id=user_id, text=row["content"], parse_mode="HTML"
-        )
-    elif ct == "photo":
-        sent = await bot.send_photo(
-            chat_id=user_id, photo=row["file_id"],
-            caption=caption or None, parse_mode="HTML"
-        )
-    elif ct == "video":
-        sent = await bot.send_video(
-            chat_id=user_id, video=row["file_id"],
-            caption=caption or None, parse_mode="HTML"
-        )
-    elif ct == "document":
-        sent = await bot.send_document(
-            chat_id=user_id, document=row["file_id"],
-            caption=caption or None, parse_mode="HTML"
-        )
-    elif ct == "voice":
-        sent = await bot.send_voice(chat_id=user_id, voice=row["file_id"])
-    elif ct == "sticker":
-        sent = await bot.send_sticker(chat_id=user_id, sticker=row["file_id"])
-    else:
-        raise ValueError(f"Неизвестный content_type: {ct}")
+    async def _do_send(with_effect: bool) -> object:
+        eid = effect_id if with_effect else None
+        if ct == "text":
+            return await bot.send_message(
+                chat_id=user_id, text=row["content"],
+                parse_mode="HTML",
+                message_effect_id=eid
+            )
+        elif ct == "photo":
+            return await bot.send_photo(
+                chat_id=user_id, photo=row["file_id"],
+                caption=caption or None, parse_mode="HTML",
+                message_effect_id=eid
+            )
+        elif ct == "video":
+            return await bot.send_video(
+                chat_id=user_id, video=row["file_id"],
+                caption=caption or None, parse_mode="HTML",
+                message_effect_id=eid
+            )
+        elif ct == "document":
+            return await bot.send_document(
+                chat_id=user_id, document=row["file_id"],
+                caption=caption or None, parse_mode="HTML",
+                message_effect_id=eid
+            )
+        elif ct == "voice":
+            return await bot.send_voice(
+                chat_id=user_id, voice=row["file_id"],
+                message_effect_id=eid
+            )
+        elif ct == "sticker":
+            return await bot.send_sticker(chat_id=user_id, sticker=row["file_id"])
+        else:
+            raise ValueError(f"Неизвестный content_type: {ct}")
+
+    # Пробуем с эффектом; если Telegram отклонил — повторяем без него
+    try:
+        sent = await _do_send(with_effect=True)
+    except Exception as e:
+        if effect_id and "EFFECT_ID_INVALID" in str(e):
+            logger.warning(f"Effect {effect_id} rejected by Telegram, sending without effect")
+            sent = await _do_send(with_effect=False)
+        else:
+            raise
 
     # Маппинг для /delete
     await db.execute(
